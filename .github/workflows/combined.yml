@@ -27,9 +27,11 @@ env:
   SWIFTPROTOBUF_VERSION: "1.29.0"
 
 jobs:
-  build:
+  build-eevee:
+    name: Build Eevee components
     runs-on: macos-latest
-
+    outputs:
+      eevee_version: ${{ steps.version.outputs.eevee_version }}
     steps:
       - name: Checkout EeveeSpotify
         uses: actions/checkout@v4
@@ -50,39 +52,31 @@ jobs:
           path: ${{ github.workspace }}/theos
           submodules: recursive
 
+      - name: Cache EeveeSwiftProtobuf.framework
+        id: protobuf-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.THEOS }}/lib/iphone/rootless/EeveeSwiftProtobuf.framework
+          key: eevee-swiftprotobuf-${{ runner.os }}-xcode26.1.1-v${{ env.SWIFTPROTOBUF_VERSION }}-${{ hashFiles('Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh') }}
+
       - name: Install build tools
         shell: bash
         run: |
           set -euo pipefail
-
           brew install make dpkg ldid wget
-
           echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
-
-          python3 -m pip install \
-            --upgrade \
-            --break-system-packages \
-            git+https://github.com/asdfzxcvbn/pyzule-rw.git
-
+          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
           ARCH="$(uname -m)"
-          if [ "$ARCH" = "x86_64" ]; then
-            SUFFIX="macos-amd64"
-          else
-            SUFFIX="macos-arm64"
-          fi
-
-          sudo curl -fsSL \
-            "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" \
-            -o /usr/local/bin/ipapatch
-
+          if [ "$ARCH" = "x86_64" ]; then SUFFIX="macos-amd64"; else SUFFIX="macos-arm64"; fi
+          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch
           sudo chmod +x /usr/local/bin/ipapatch
           ipapatch --help >/dev/null
 
       - name: Build EeveeSwiftProtobuf.framework
+        if: steps.protobuf-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
-
           chmod +x Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
           Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
 
@@ -92,89 +86,78 @@ jobs:
           REPO_SLUG: ${{ github.repository }}
         run: |
           set -euo pipefail
-
-          THEOS_PACKAGE_SCHEME=rootless \
-            make package FINALPACKAGE=1
-
-          DEB_PATH="$(
-            find packages \
-              -type f \
-              -name 'com.eevee.spotify_*.deb' \
-              -print \
-              | head -n 1
-          )"
-
+          THEOS_PACKAGE_SCHEME=rootless make package FINALPACKAGE=1
+          DEB_PATH="$(find packages -type f -name 'com.eevee.spotify_*.deb' -print | head -n 1)"
           if [ -z "$DEB_PATH" ]; then
             echo "::error::Eevee .deb was not produced."
             exit 1
           fi
+          mkdir -p "${RUNNER_TEMP}/eevee-components"
+          cp "$DEB_PATH" "${RUNNER_TEMP}/eevee-components/eevee.deb"
+          cp control "${RUNNER_TEMP}/eevee-components/control"
 
-          echo "DEB_PATH=$DEB_PATH" >> "$GITHUB_ENV"
-          echo "DEB_NAME=$(basename "$DEB_PATH")" >> "$GITHUB_ENV"
+      - name: Build zxPluginsInject.dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x Tools/build-zxpi.sh
+          Tools/build-zxpi.sh
+          test -f packages/zxPluginsInject.dylib || { echo "::error::zxPluginsInject.dylib was not produced."; exit 1; }
+          cp packages/zxPluginsInject.dylib "${RUNNER_TEMP}/eevee-components/zxPluginsInject.dylib"
 
-          ls -lh "$DEB_PATH"
+      - name: Read Eevee version
+        id: version
+        shell: bash
+        run: echo "eevee_version=$(awk '$1 == "Version:" { print $2; exit }' control)" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Eevee .deb artifact
+      - name: Upload Eevee components
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.DEB_NAME }}
-          path: ${{ env.DEB_PATH }}
+          name: eevee-components
+          path: ${{ runner.temp }}/eevee-components/
           if-no-files-found: error
+
+  build-spoti:
+    name: Build spoti.pw IPA
+    runs-on: macos-latest
+    steps:
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install make dpkg ldid wget
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
       - name: Download decrypted Spotify IPA
         shell: bash
         run: |
           set -euo pipefail
-
-          curl -fsSL \
-            "${{ inputs.ipa_url }}" \
-            -o "${{ github.workspace }}/spotify.ipa"
-
-          FILE_TYPE="$(file --mime-type -b "${{ github.workspace }}/spotify.ipa")"
-
+          curl -fsSL "${{ inputs.ipa_url }}" -o "${RUNNER_TEMP}/spotify.ipa"
+          FILE_TYPE="$(file --mime-type -b "${RUNNER_TEMP}/spotify.ipa")"
           if [[ "$FILE_TYPE" != "application/x-ios-app" && "$FILE_TYPE" != "application/zip" ]]; then
             echo "::error::Downloaded file is not a valid IPA: $FILE_TYPE"
             exit 1
           fi
 
-          ls -lh "${{ github.workspace }}/spotify.ipa"
-
       - name: Verify Spotify 9.1.78
         shell: bash
         run: |
           set -euo pipefail
-
-          unzip -p \
-            "${{ github.workspace }}/spotify.ipa" \
-            'Payload/*.app/Info.plist' \
-            > "${RUNNER_TEMP}/Spotify-Info.plist"
-
-          SPOTIFY_VERSION="$(
-            plutil \
-              -extract CFBundleShortVersionString raw \
-              "${RUNNER_TEMP}/Spotify-Info.plist"
-          )"
-
+          unzip -p "${RUNNER_TEMP}/spotify.ipa" 'Payload/*.app/Info.plist' > "${RUNNER_TEMP}/Spotify-Info.plist"
+          SPOTIFY_VERSION="$(plutil -extract CFBundleShortVersionString raw "${RUNNER_TEMP}/Spotify-Info.plist")"
           echo "Spotify version: ${SPOTIFY_VERSION}"
-
           if [ "$SPOTIFY_VERSION" != "9.1.78" ]; then
             echo "::error::This combined workflow is pinned to Spotify 9.1.78."
             exit 1
           fi
 
-      - name: Checkout spoti.pw v0.21.1
+      - name: Checkout latest spoti.pw
         shell: bash
         run: |
           set -euo pipefail
-
-          git clone \
-            --depth 1 \
-            --branch v0.21.1 \
-            https://github.com/skopevoj/spoti.pw.git \
-            "${RUNNER_TEMP}/spoti.pw"
-
+          git clone --depth 1 https://github.com/skopevoj/spoti.pw.git "${RUNNER_TEMP}/spoti.pw"
           cd "${RUNNER_TEMP}/spoti.pw"
-
           echo "spoti.pw commit:"
           git rev-parse HEAD
 
@@ -182,231 +165,138 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           SPOTI_DIR="${RUNNER_TEMP}/spoti.pw"
           SPOTI_OUTPUT="${RUNNER_TEMP}/spoti-final.ipa"
-
           mkdir -p "${SPOTI_DIR}/ipa"
-
-          cp \
-            "${{ github.workspace }}/spotify.ipa" \
-            "${SPOTI_DIR}/ipa/spotify.ipa"
-
-          cd "${SPOTI_DIR}"
-
+          cp "${RUNNER_TEMP}/spotify.ipa" "${SPOTI_DIR}/ipa/spotify.ipa"
+          cd "$SPOTI_DIR"
           make release
-
           echo "spoti.pw output candidates:"
-          find "${SPOTI_DIR}/out" \
-            -maxdepth 1 \
-            -type f \
-            -name '*.ipa' \
-            -print
-
-          SPOTI_BUILT="$(
-            find "${SPOTI_DIR}/out" \
-              -maxdepth 1 \
-              -type f \
-              -name '*.ipa' \
-              -print \
-              | head -n 1
-          )"
-
+          find "${SPOTI_DIR}/out" -maxdepth 1 -type f -name '*.ipa' -print
+          SPOTI_BUILT="$(find "${SPOTI_DIR}/out" -maxdepth 1 -type f -name '*.ipa' -print | head -n 1)"
           if [ -z "$SPOTI_BUILT" ]; then
             echo "::error::spoti.pw did not produce an IPA."
             exit 1
           fi
-
-          echo "spoti.pw produced:"
-          echo "$SPOTI_BUILT"
-
           cp "$SPOTI_BUILT" "$SPOTI_OUTPUT"
-
-          if [ ! -f "$SPOTI_OUTPUT" ]; then
-            echo "::error::Failed to create absolute-path spoti.pw IPA."
-            exit 1
-          fi
-
+          test -f "$SPOTI_OUTPUT" || { echo "::error::Failed to create absolute-path spoti.pw IPA."; exit 1; }
           echo "Final spoti.pw IPA:"
           ls -lh "$SPOTI_OUTPUT"
 
-          # Deliberately write an absolute path.
-          echo "SPOTI_IPA=$SPOTI_OUTPUT" >> "$GITHUB_ENV"
+      - name: Upload spoti.pw IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: spoti-ipa
+          path: ${{ runner.temp }}/spoti-final.ipa
+          if-no-files-found: error
 
-      - name: Build zxPluginsInject.dylib
+  combine:
+    name: Inject Eevee and publish IPA
+    runs-on: macos-latest
+    needs:
+      - build-eevee
+      - build-spoti
+    steps:
+      - name: Checkout EeveeSpotify
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.eevee_ref }}
+          fetch-depth: 1
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Restore artifact paths
         shell: bash
         run: |
           set -euo pipefail
+          SPOTI_ARTIFACT="${RUNNER_TEMP}/artifacts/spoti-ipa/spoti-final.ipa"
+          COMPONENTS="${RUNNER_TEMP}/artifacts/eevee-components"
+          test -f "$SPOTI_ARTIFACT" || { echo "::error::spoti-ipa artifact is missing its IPA."; find "${RUNNER_TEMP}/artifacts" -maxdepth 3 -type f -print; exit 1; }
+          test -f "${COMPONENTS}/eevee.deb" || { echo "::error::Eevee .deb artifact is missing."; exit 1; }
+          test -f "${COMPONENTS}/zxPluginsInject.dylib" || { echo "::error::zxPluginsInject artifact is missing."; exit 1; }
+          cp "$SPOTI_ARTIFACT" "${RUNNER_TEMP}/spoti-final.ipa"
+          echo "SPOTI_IPA=${RUNNER_TEMP}/spoti-final.ipa" >> "$GITHUB_ENV"
 
-          chmod +x Tools/build-zxpi.sh
-          Tools/build-zxpi.sh
-
-          if [ ! -f packages/zxPluginsInject.dylib ]; then
-            echo "::error::zxPluginsInject.dylib was not produced."
-            exit 1
-          fi
+      - name: Install injection tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install make dpkg ldid wget
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          ARCH="$(uname -m)"
+          if [ "$ARCH" = "x86_64" ]; then SUFFIX="macos-amd64"; else SUFFIX="macos-arm64"; fi
+          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch
+          sudo chmod +x /usr/local/bin/ipapatch
+          ipapatch --help >/dev/null
 
       - name: Extract Eevee components
         shell: bash
         run: |
           set -euo pipefail
-
+          DEB_PATH="${RUNNER_TEMP}/artifacts/eevee-components/eevee.deb"
           DEB_EXTRACT="${RUNNER_TEMP}/eevee-deb"
-
-          rm -rf "$DEB_EXTRACT"
           mkdir -p "$DEB_EXTRACT"
-
-          dpkg-deb \
-            -R \
-            "$DEB_PATH" \
-            "$DEB_EXTRACT"
-
-          DYLIB_SRC="$(
-            find "$DEB_EXTRACT" \
-              -type f \
-              -name 'EeveeSpotify.dylib' \
-              -print \
-              | head -n 1
-          )"
-
-          BUNDLE_SRC="$(
-            find "$DEB_EXTRACT" \
-              -type d \
-              -name 'EeveeSpotify.bundle' \
-              -print \
-              | head -n 1
-          )"
-
-          FRAMEWORK_SRC="$(
-            find "$DEB_EXTRACT" \
-              -type d \
-              -name 'EeveeSwiftProtobuf.framework' \
-              -print \
-              | head -n 1
-          )"
-
+          dpkg-deb -R "$DEB_PATH" "$DEB_EXTRACT"
+          DYLIB_SRC="$(find "$DEB_EXTRACT" -type f -name 'EeveeSpotify.dylib' -print | head -n 1)"
+          BUNDLE_SRC="$(find "$DEB_EXTRACT" -type d -name 'EeveeSpotify.bundle' -print | head -n 1)"
+          FRAMEWORK_SRC="$(find "$DEB_EXTRACT" -type d -name 'EeveeSwiftProtobuf.framework' -print | head -n 1)"
           if [ -z "$DYLIB_SRC" ]; then
             echo "::error::EeveeSpotify.dylib was not found in the .deb."
             exit 1
           fi
-
           echo "DYLIB_SRC=$DYLIB_SRC" >> "$GITHUB_ENV"
-
-          if [ -n "$BUNDLE_SRC" ]; then
-            echo "BUNDLE_SRC=$BUNDLE_SRC" >> "$GITHUB_ENV"
-          fi
-
-          if [ -n "$FRAMEWORK_SRC" ]; then
-            echo "FRAMEWORK_SRC=$FRAMEWORK_SRC" >> "$GITHUB_ENV"
-          fi
-
+          [ -z "$BUNDLE_SRC" ] || echo "BUNDLE_SRC=$BUNDLE_SRC" >> "$GITHUB_ENV"
+          [ -z "$FRAMEWORK_SRC" ] || echo "FRAMEWORK_SRC=$FRAMEWORK_SRC" >> "$GITHUB_ENV"
           echo "Eevee dylib: $DYLIB_SRC"
           echo "Eevee bundle: ${BUNDLE_SRC:-none}"
           echo "Eevee framework: ${FRAMEWORK_SRC:-none}"
 
       - name: Inject Eevee into spoti.pw IPA
         shell: bash
+        env:
+          EEVEE_VERSION: ${{ needs.build-eevee.outputs.eevee_version }}
         run: |
           set -euo pipefail
-
-          # Use the absolute path created by the previous step.
           SPOTI_INPUT="${SPOTI_IPA}"
-
           if [ ! -f "$SPOTI_INPUT" ]; then
-            echo "::error::spoti.pw IPA does not exist:"
-            echo "$SPOTI_INPUT"
-            echo
-            echo "IPA files currently under RUNNER_TEMP:"
+            echo "::error::spoti.pw IPA does not exist: $SPOTI_INPUT"
             find "$RUNNER_TEMP" -type f -name '*.ipa' -print
             exit 1
           fi
-
-          mkdir -p "${{ github.workspace }}/Outputs/IPAS"
-
-          SPOTIFY_VERSION="$(
-            unzip -p \
-              "${{ github.workspace }}/spotify.ipa" \
-              'Payload/*.app/Info.plist' |
-            plutil \
-              -extract CFBundleShortVersionString raw -
-          )"
-
-          EEVEE_VERSION="$(
-            grep -E '^Version:' control |
-            awk '{print $2}'
-          )"
-
-          OUT_IPA="${{ github.workspace }}/Outputs/IPAS/Spotify-${SPOTIFY_VERSION}-spoti-Eevee-${EEVEE_VERSION}.ipa"
-
+          mkdir -p "${GITHUB_WORKSPACE}/Outputs/IPAS"
+          SPOTIFY_VERSION="$(unzip -p "$SPOTI_INPUT" 'Payload/*.app/Info.plist' | plutil -extract CFBundleShortVersionString raw -)"
+          OUT_IPA="${GITHUB_WORKSPACE}/Outputs/IPAS/Spotify-${SPOTIFY_VERSION}-spoti-Eevee-${EEVEE_VERSION}.ipa"
           INJECT=("$DYLIB_SRC")
-
-          if [ -n "${FRAMEWORK_SRC:-}" ]; then
-            INJECT+=("$FRAMEWORK_SRC")
-          fi
-
-          if [ -n "${BUNDLE_SRC:-}" ]; then
-            INJECT+=("$BUNDLE_SRC")
-          fi
-
-          echo "Input:"
-          echo "$SPOTI_INPUT"
-
-          echo
+          if [ -n "${FRAMEWORK_SRC:-}" ]; then INJECT+=("$FRAMEWORK_SRC"); fi
+          if [ -n "${BUNDLE_SRC:-}" ]; then INJECT+=("$BUNDLE_SRC"); fi
+          echo "Input: $SPOTI_INPUT"
           echo "Injecting:"
           printf '  %s\n' "${INJECT[@]}"
-
-          echo
-          echo "Output:"
-          echo "$OUT_IPA"
-
-          cyan \
-            -i "$SPOTI_INPUT" \
-            -o "$OUT_IPA" \
-            -f "${INJECT[@]}" \
-            -c 9 \
-            -m 15.0 \
-            -du
-
-          if [ ! -f "$OUT_IPA" ]; then
-            echo "::error::cyan did not produce the final IPA."
-            exit 1
-          fi
-
+          echo "Output: $OUT_IPA"
+          cyan -i "$SPOTI_INPUT" -o "$OUT_IPA" -f "${INJECT[@]}" -c 9 -m 15.0 -du
+          test -f "$OUT_IPA" || { echo "::error::cyan did not produce the final IPA."; exit 1; }
           echo "OUT_IPA=$OUT_IPA" >> "$GITHUB_ENV"
-
           ls -lh "$OUT_IPA"
 
       - name: LC-inject zxPluginsInject
         shell: bash
         run: |
           set -euo pipefail
-
-          ipapatch \
-            --input "$OUT_IPA" \
-            --inplace \
-            --noconfirm \
-            --dylib packages/zxPluginsInject.dylib
+          ipapatch --input "$OUT_IPA" --inplace --noconfirm --dylib "${RUNNER_TEMP}/artifacts/eevee-components/zxPluginsInject.dylib"
 
       - name: Verify final IPA
         shell: bash
         run: |
           set -euo pipefail
-
-          if [ ! -f "$OUT_IPA" ]; then
-            echo "::error::Final IPA does not exist."
-            exit 1
-          fi
-
+          test -f "$OUT_IPA" || { echo "::error::Final IPA does not exist."; exit 1; }
           echo "Final IPA:"
           ls -lh "$OUT_IPA"
-
-          echo
           echo "Injected components found in final IPA:"
-
-          unzip -l "$OUT_IPA" |
-            grep -E \
-              'spotifyglass|SpotifyGlass|EeveeSpotify|EeveeSwiftProtobuf|zxPluginsInject' \
-            || true
+          unzip -l "$OUT_IPA" | grep -E 'spotifyglass|SpotifyGlass|EeveeSpotify|EeveeSwiftProtobuf|zxPluginsInject' || true
 
       - name: Upload final IPA artifact
         if: ${{ inputs.upload_method == 'artifacts' || inputs.upload_method == 'both' }}
@@ -421,21 +311,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           BIN="spotify-combined-${{ github.run_id }}-${{ github.run_attempt }}"
           FILENAME="$(basename "$OUT_IPA")"
-
-          curl -fsS \
-            -X POST \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary "@${OUT_IPA}" \
-            "https://filebin.net/${BIN}/${FILENAME}" \
-            >/dev/null
-
+          curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@${OUT_IPA}" "https://filebin.net/${BIN}/${FILENAME}" >/dev/null
           DOWNLOAD_URL="https://filebin.net/${BIN}/${FILENAME}"
-
           echo "Uploaded to: ${DOWNLOAD_URL}"
-
           {
             echo "### Combined IPA"
             echo "- **File:** ${FILENAME}"
