@@ -45,12 +45,16 @@ jobs:
         with:
           xcode-version: "26.1.1"
 
-      - name: Setup Theos
-        uses: actions/checkout@v4
-        with:
-          repository: theos/theos
-          path: ${{ github.workspace }}/theos
-          submodules: recursive
+      - name: Install and verify Theos
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "$THEOS"
+          if [ ! -f "$THEOS/makefiles/common.mk" ]; then
+            echo "::error::Theos checkout is missing makefiles/common.mk at $THEOS"
+            exit 1
+          fi
+          echo "Theos installed at: $THEOS"
 
       - name: Cache EeveeSwiftProtobuf.framework
         id: protobuf-cache
@@ -126,12 +130,16 @@ jobs:
         with:
           xcode-version: "26.1.1"
 
-      - name: Setup Theos
-        uses: actions/checkout@v4
-        with:
-          repository: theos/theos
-          path: ${{ github.workspace }}/theos
-          submodules: recursive
+      - name: Install and verify Theos
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "$THEOS"
+          if [ ! -f "$THEOS/makefiles/common.mk" ]; then
+            echo "::error::Theos checkout is missing makefiles/common.mk at $THEOS"
+            exit 1
+          fi
+          echo "Theos installed at: $THEOS"
 
       - name: Install build tools
         shell: bash
